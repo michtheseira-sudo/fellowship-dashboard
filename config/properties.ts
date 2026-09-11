@@ -5,10 +5,18 @@
  */
 
 // ---- Lead status <> Deal stage sync ----
-// lead_status is the internal property name on the Contact object.
+// hs_lead_status is the internal property name on the Contact object -
+// confirmed 2026-09-11 (a standard HubSpot property, not custom; the
+// earlier "lead_status" guess was wrong and caused every live HubSpot
+// call to fail with a 400).
 // Deal stage is on the associated Deal, within this specific pipeline -
 // set DEAL_PIPELINE_ID in .env.local once confirmed with the team.
-export const LEAD_STATUS_PROPERTY = "lead_status";
+//
+// Two hs_lead_status options exist that this dashboard doesn't currently
+// track anywhere: "Evaluated Candidate" and "Rejected". Add a FUNNEL_STAGES
+// entry for either if the team wants them surfaced later - not otherwise
+// referenced in code, so adding is additive and low-risk.
+export const LEAD_STATUS_PROPERTY = "hs_lead_status";
 export const DEAL_PIPELINE_ID = process.env.DEAL_PIPELINE_ID ?? "";
 
 export const FUNNEL_STAGES = [
@@ -22,14 +30,14 @@ export const FUNNEL_STAGES = [
   {
     key: "new_candidate",
     label: "New Candidate",
-    leadStatusValue: "New candidate",
+    leadStatusValue: "Candidate",
     dealStageValue: null,
     note: "Applied.",
   },
   {
     key: "scheduled_interview",
     label: "Scheduled Interview",
-    leadStatusValue: "Scheduled Interview",
+    leadStatusValue: "Scheduled interview",
     dealStageValue: null,
     note: "Booked an orientation session.",
   },
@@ -37,28 +45,28 @@ export const FUNNEL_STAGES = [
     key: "accepted_fellow",
     label: "Accepted Fellow",
     leadStatusValue: "Accepted Fellow",
-    dealStageValue: "Invited to enroll",
+    dealStageValue: "166592743", // "Invited to enroll"
     note: "Accepted into the program.",
   },
   {
     key: "booked_fellow",
     label: "Booked Fellow",
     leadStatusValue: "Booked Fellow",
-    dealStageValue: "Paid deposit",
+    dealStageValue: "166592744", // "Paid deposit"
     note: "Paid €300 deposit.",
   },
   {
     key: "paying_fellow",
     label: "Paying Fellow",
     leadStatusValue: "Paying Fellow",
-    dealStageValue: "Paid installment",
+    dealStageValue: "166592746", // "Paid installment"
     note: "Paid first installment.",
   },
   {
     key: "confirmed_fellow",
     label: "Confirmed Fellow",
     leadStatusValue: "Confirmed Fellow",
-    dealStageValue: "Closed won",
+    dealStageValue: "166592748", // "Closed won"
     note: "Fully paid.",
   },
   {
@@ -70,7 +78,7 @@ export const FUNNEL_STAGES = [
   },
 ] as const;
 
-export const DEAL_STAGE_CLOSED_LOST = "Closed lost";
+export const DEAL_STAGE_CLOSED_LOST = "166592749"; // "Closed lost"
 // Deal created, no response, rejected, or declined offer.
 
 // ---- Season / Year ----

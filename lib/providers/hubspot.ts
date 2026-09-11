@@ -349,8 +349,12 @@ export async function getLiveFunnel(season: Season): Promise<FunnelResponse> {
   }
 
   // 2. Deals: Closed Won / Closed Lost (real outcomes, not simulated) plus
-  // all-pipeline "Deals Created".
-  const wonDeals = await fetchDealsByStage("Closed won");
+  // all-pipeline "Deals Created". Closed Won's stage ID comes from
+  // FUNNEL_STAGES (confirmed_fellow) rather than being hardcoded here -
+  // this exact pattern (a second hardcoded copy silently drifting from
+  // the confirmed value) already caused two other bugs today.
+  const closedWonStageId = FUNNEL_STAGES.find((s) => s.key === "confirmed_fellow")!.dealStageValue!;
+  const wonDeals = await fetchDealsByStage(closedWonStageId);
   const lostDeals = await fetchDealsByStage(DEAL_STAGE_CLOSED_LOST);
   const allDeals = await fetchAllDealsInPipeline();
 
@@ -486,13 +490,16 @@ function resolveSource(contact: any): { source: string; hadUtm: boolean; hadHear
   return { source: "Unknown", hadUtm: false, hadHeardAbout: false };
 }
 
-const ATTRIBUTION_STAGES = [
-  { key: "new_candidate", leadStatusValue: "New candidate" },
-  { key: "accepted_fellow", leadStatusValue: "Accepted Fellow" },
-  { key: "booked_fellow", leadStatusValue: "Booked Fellow" },
-  { key: "paying_fellow", leadStatusValue: "Paying Fellow" },
-  { key: "confirmed_fellow", leadStatusValue: "Confirmed Fellow" },
-] as const;
+const ATTRIBUTION_STAGE_KEYS = ["new_candidate", "accepted_fellow", "booked_fellow", "paying_fellow", "confirmed_fellow"] as const;
+// Derived from FUNNEL_STAGES rather than hardcoded here - this exact
+// duplication (a second, separately-hardcoded "New candidate" that also
+// turned out wrong) is what caused the attribution 400 even after fixing
+// FUNNEL_STAGES itself. Single source of truth now.
+const ATTRIBUTION_STAGES = ATTRIBUTION_STAGE_KEYS.map((key) => {
+  const stage = FUNNEL_STAGES.find((s) => s.key === key);
+  if (!stage) throw new Error(`FUNNEL_STAGES is missing an entry for "${key}"`);
+  return { key, leadStatusValue: stage.leadStatusValue };
+});
 
 const LEAD_TIME_PROPERTIES = ["hs_analytics_first_timestamp", "first_conversion_date"];
 const LEAD_TIME_BUCKET_ORDER = ["Same day", "1-3 days", "4-7 days", "1-2 weeks", "2-4 weeks", "1+ months"];
@@ -593,7 +600,8 @@ export async function getLiveAttribution(): Promise<AttributionResponse> {
   };
 
   // Lead sources: classify "Lead" stage contacts by first-form-submitted.
-  const leadContacts = await fetchAllContactsByLeadStatus("Lead", [FIRST_CONVERSION_EVENT_PROPERTY]);
+  const leadStageValue = FUNNEL_STAGES.find((s) => s.key === "lead")!.leadStatusValue;
+  const leadContacts = await fetchAllContactsByLeadStatus(leadStageValue, [FIRST_CONVERSION_EVENT_PROPERTY]);
   let metaCount = 0;
   let newsletterCount = 0;
   let otherCount = 0;
