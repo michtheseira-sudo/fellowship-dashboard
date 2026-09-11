@@ -11,6 +11,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import DataError from "@/components/DataError";
 import type { AttributionResponse } from "@/lib/types";
 
 const STAGE_KEYS = [
@@ -23,13 +24,22 @@ const STAGE_KEYS = [
 
 export default function AttributionPage() {
   const [data, setData] = useState<AttributionResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     fetch("/api/attribution")
       .then((r) => r.json())
-      .then(setData);
+      .then((d) => {
+        if (d && d.error) {
+          setError(d.error);
+        } else {
+          setData(d);
+        }
+      })
+      .catch((err) => setError(err.message));
   }, []);
 
+  if (error) return <div className="px-10 py-8"><DataError message={error} /></div>;
   if (!data) return <div className="px-10 py-8 text-sm text-muted">Loading…</div>;
 
   const utmTotal = data.utmCoverage.withUtm + data.utmCoverage.fallbackHeardAbout + data.utmCoverage.neither;

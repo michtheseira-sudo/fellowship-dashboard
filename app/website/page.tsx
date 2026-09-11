@@ -10,17 +10,27 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import DataError from "@/components/DataError";
 import type { WebsiteResponse } from "@/lib/types";
 
 export default function WebsitePage() {
   const [data, setData] = useState<WebsiteResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     fetch("/api/website")
       .then((r) => r.json())
-      .then(setData);
+      .then((d) => {
+        if (d && d.error) {
+          setError(d.error);
+        } else {
+          setData(d);
+        }
+      })
+      .catch((err) => setError(err.message));
   }, []);
 
+  if (error) return <div className="px-10 py-8"><DataError message={error} /></div>;
   if (!data) return <div className="px-10 py-8 text-sm text-muted">Loading…</div>;
 
   return (

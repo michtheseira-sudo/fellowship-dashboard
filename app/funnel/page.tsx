@@ -8,22 +8,34 @@ import FunnelDrip from "@/components/FunnelDrip";
 import StageTabs from "@/components/StageTabs";
 import DealsChart from "@/components/DealsChart";
 import MeetingsSection from "@/components/MeetingsChart";
+import DataError from "@/components/DataError";
 import type { FunnelResponse } from "@/lib/types";
 
 export default function FunnelPage() {
   const [season, setSeason] = useState<"Summer" | "Winter">("Summer");
   const [data, setData] = useState<FunnelResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [activeStage, setActiveStage] = useState(0);
 
   useEffect(() => {
     setLoading(true);
+    setError(null);
     fetch(`/api/funnel?season=${season}`)
       .then((r) => r.json())
       .then((d) => {
-        setData(d);
+        if (d && d.error) {
+          setError(d.error);
+          setData(null);
+        } else {
+          setData(d);
+        }
         setLoading(false);
         setActiveStage(0);
+      })
+      .catch((err) => {
+        setError(err.message);
+        setLoading(false);
       });
   }, [season]);
 
@@ -39,6 +51,7 @@ export default function FunnelPage() {
       <FilterBar season={season} onSeasonChange={setSeason} />
 
       {loading && <div className="text-sm text-muted">Loading…</div>}
+      {error && <DataError message={error} />}
 
       {data && (
         <>
