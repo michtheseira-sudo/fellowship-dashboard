@@ -83,7 +83,7 @@ export default function AttributionPage() {
         <CoverageStat label="Neither" value={data.utmCoverage.neither} total={utmTotal} color="text-danger" />
       </div>
 
-      <div className="border border-line p-5">
+      <div className="border border-line p-5 mb-8">
         <h2 className="font-head text-sm font-medium text-ink mb-4">Applicants by source, by funnel stage</h2>
         <ResponsiveContainer width="100%" height={320}>
           <BarChart data={data.bySourceByStage} margin={{ left: -10 }}>
@@ -98,6 +98,36 @@ export default function AttributionPage() {
           </BarChart>
         </ResponsiveContainer>
       </div>
+
+      <section>
+        <h2 className="font-head text-sm font-medium text-ink mb-1">Time to first conversion</h2>
+        <p className="text-xs text-muted mb-4">
+          Days between a contact&rsquo;s first-ever site visit and their first form submission
+          (any form — Lead-stage or application). Based on {data.leadTimeToFirstConversion.sampleSize.toLocaleString()}{" "}
+          contacts with both dates recorded.
+        </p>
+        <div className="border border-line p-5">
+          <div className="flex gap-8 mb-5">
+            <div>
+              <div className="text-xs text-muted mb-1">Average</div>
+              <div className="font-mono text-xl text-ink tabular">{data.leadTimeToFirstConversion.averageDays} days</div>
+            </div>
+            <div>
+              <div className="text-xs text-muted mb-1">Median</div>
+              <div className="font-mono text-xl text-ink tabular">{data.leadTimeToFirstConversion.medianDays} days</div>
+            </div>
+          </div>
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={data.leadTimeToFirstConversion.distribution}>
+              <CartesianGrid stroke="#E3E1E3" vertical={false} />
+              <XAxis dataKey="label" tick={{ fontSize: 11, fill: "#8A8288" }} axisLine={{ stroke: "#E3E1E3" }} tickLine={false} />
+              <YAxis tick={{ fontSize: 11, fill: "#8A8288" }} axisLine={false} tickLine={false} />
+              <Tooltip contentStyle={{ border: "1px solid #E3E1E3", borderRadius: 2, fontSize: 12 }} />
+              <Bar dataKey="count" fill="#30c2c9" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </section>
     </div>
   );
 }

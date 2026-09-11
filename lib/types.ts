@@ -79,18 +79,35 @@ export interface MeetingsBreakdown {
   completionRate: number; // completed / booked, 0-1
 }
 
-export interface WebsiteResponse {
-  visitorsOverTime: WeeklyPoint[];
+export interface WebsitePeriodStats {
   avgSessionDurationSeconds: number;
   topPages: { path: string; views: number }[];
   underperformingPages: { path: string; views: number; threshold: number }[];
   geography: { country: string; sessions: number }[];
   topKeywords: { keyword: string; clicks: number }[];
+}
+
+export interface WebsiteResponse {
+  visitorsOverTime: WeeklyPoint[]; // real calendar weeks, real dates - last ~12 weeks
+  thisWeek: WebsitePeriodStats;
+  thisMonth: WebsitePeriodStats;
   shopify: {
     checkoutStarts: number;
     checkoutCompletions: number;
     topProductViews: { product: string; views: number }[];
   };
+}
+
+export interface LeadTimeBucket {
+  label: string;
+  count: number;
+}
+
+export interface LeadTimeStats {
+  averageDays: number;
+  medianDays: number;
+  sampleSize: number;
+  distribution: LeadTimeBucket[];
 }
 
 export interface AttributionResponse {
@@ -108,5 +125,6 @@ export interface AttributionResponse {
     fallbackHeardAbout: number;
     neither: number;
   };
-  leadSources: { source: string; count: number }[]; // Tally Quiz / Newsletter / Meta Ad Form
+  leadSources: { source: string; count: number }[]; // Meta Ads Lead / Newsletter Fellowship New Website / Other
+  leadTimeToFirstConversion: LeadTimeStats; // first site visit -> first form fill
 }

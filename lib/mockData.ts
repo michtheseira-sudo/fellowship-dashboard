@@ -6,9 +6,11 @@ import type {
   AttributionResponse,
   DealsBreakdown,
   FunnelResponse,
+  LeadTimeStats,
   MeetingsBreakdown,
   Season,
   StageSeries,
+  WebsitePeriodStats,
   WebsiteResponse,
   WeeklyPoint,
 } from "@/lib/types";
@@ -217,36 +219,64 @@ function computeMeetingsBreakdown(booked: WeeklyPoint[], completed: WeeklyPoint[
 
 export function getMockWebsite(): WebsiteResponse {
   const rand = seededRandom(555);
-  const visitorsOverTime: WeeklyPoint[] = buildWeeklySeries("Summer", 2026, 2100, rand, 12);
+
+  // Real calendar weeks, real dates - last 12 weeks, trending upward.
+  const today = new Date();
+  const visitorsOverTime: WeeklyPoint[] = [];
+  for (let i = 11; i >= 0; i--) {
+    const weekStart = new Date(today);
+    weekStart.setDate(today.getDate() - i * 7 - today.getDay() + 1); // Monday-ish
+    const base = 1400 + (11 - i) * 90; // gentle upward trend
+    visitorsOverTime.push({
+      weekOfSeason: 12 - i,
+      weekStartDate: weekStart.toISOString().slice(0, 10),
+      year: weekStart.getFullYear(),
+      value: Math.round(base * (0.9 + rand() * 0.2)),
+    });
+  }
+
+  const thisMonth: WebsitePeriodStats = {
+    avgSessionDurationSeconds: 158,
+    topPages: [
+      { path: "/apply", views: 3210 },
+      { path: "/", views: 2840 },
+      { path: "/programs/pre-health-fellowship", views: 1990 },
+      { path: "/faq", views: 1140 },
+      { path: "/testimonials", views: 890 },
+    ],
+    underperformingPages: [
+      { path: "/blog/scholarship-guide-2024", views: 14, threshold: 100 },
+      { path: "/programs/legacy-track", views: 6, threshold: 100 },
+      { path: "/partners", views: 22, threshold: 100 },
+    ],
+    geography: [
+      { country: "United States", sessions: 4120 },
+      { country: "Portugal", sessions: 980 },
+      { country: "United Kingdom", sessions: 760 },
+      { country: "Canada", sessions: 590 },
+      { country: "India", sessions: 410 },
+    ],
+    topKeywords: [
+      { keyword: "pre health fellowship abroad", clicks: 310 },
+      { keyword: "clinical shadowing program", clicks: 205 },
+      { keyword: "gap year premed program", clicks: 168 },
+      { keyword: "medical fellowship summer", clicks: 129 },
+    ],
+  };
+
+  // "This week" is a subset of "this month" - roughly a quarter of the volume.
+  const thisWeek: WebsitePeriodStats = {
+    avgSessionDurationSeconds: 162,
+    topPages: thisMonth.topPages.map((p) => ({ ...p, views: Math.round(p.views * 0.27) })),
+    underperformingPages: thisMonth.underperformingPages.map((p) => ({ ...p, views: Math.round(p.views * 0.27) })),
+    geography: thisMonth.geography.map((g) => ({ ...g, sessions: Math.round(g.sessions * 0.27) })),
+    topKeywords: thisMonth.topKeywords.map((k) => ({ ...k, clicks: Math.round(k.clicks * 0.27) })),
+  };
 
   return {
     visitorsOverTime,
-    avgSessionDurationSeconds: 154,
-    topPages: [
-      { path: "/apply", views: 8420 },
-      { path: "/", views: 7110 },
-      { path: "/programs/pre-health-fellowship", views: 5230 },
-      { path: "/faq", views: 3190 },
-      { path: "/testimonials", views: 2510 },
-    ],
-    underperformingPages: [
-      { path: "/blog/scholarship-guide-2024", views: 42, threshold: 100 },
-      { path: "/programs/legacy-track", views: 18, threshold: 100 },
-      { path: "/partners", views: 61, threshold: 100 },
-    ],
-    geography: [
-      { country: "United States", sessions: 12400 },
-      { country: "Portugal", sessions: 3100 },
-      { country: "United Kingdom", sessions: 2450 },
-      { country: "Canada", sessions: 1890 },
-      { country: "India", sessions: 1320 },
-    ],
-    topKeywords: [
-      { keyword: "pre health fellowship abroad", clicks: 940 },
-      { keyword: "clinical shadowing program", clicks: 610 },
-      { keyword: "gap year premed program", clicks: 505 },
-      { keyword: "medical fellowship summer", clicks: 388 },
-    ],
+    thisWeek,
+    thisMonth,
     shopify: {
       checkoutStarts: 640,
       checkoutCompletions: 512,
@@ -284,26 +314,44 @@ export function getMockAttribution(): AttributionResponse {
     };
   });
 
-  // Lead source split - top-of-funnel, pre-application. Roughly weighted
-  // toward the quiz (highest-intent top-of-funnel channel), then meta ads,
-  // then newsletter as the smallest of the three.
+  // Lead source split - top-of-funnel, pre-application. Confirmed with the
+  // team: every Lead comes through one of exactly two forms, classified by
+  // HubSpot's first_conversion_event_name property. Weighted toward Meta
+  // ads as the larger paid channel, small "Other" bucket for anything that
+  // doesn't match either form name exactly (matches the real classification
+  // logic in lib/providers/hubspot.ts).
   const leadRand = seededRandom(4711);
   const totalLeads = Math.round(1800 + leadRand() * 400);
-  const tallyShare = 0.5 + leadRand() * 0.08;
-  const metaShare = 0.3 + leadRand() * 0.06;
-  const tallyCount = Math.round(totalLeads * tallyShare);
+  const metaShare = 0.58 + leadRand() * 0.08;
+  const newsletterShare = 0.35 + leadRand() * 0.06;
   const metaCount = Math.round(totalLeads * metaShare);
-  const newsletterCount = totalLeads - tallyCount - metaCount;
+  const newsletterCount = Math.round(totalLeads * newsletterShare);
+  const otherCount = Math.max(0, totalLeads - metaCount - newsletterCount);
   const leadSources = [
-    { source: "Tally Quiz", count: tallyCount },
-    { source: "Meta Ad Form", count: metaCount },
-    { source: "Newsletter", count: newsletterCount },
+    { source: "Meta Ads Lead", count: metaCount },
+    { source: "Newsletter Fellowship New Website", count: newsletterCount },
+    { source: "Other / Unknown", count: otherCount },
   ];
+
+  const leadTimeToFirstConversion: LeadTimeStats = {
+    averageDays: 6.4,
+    medianDays: 2,
+    sampleSize: 1842,
+    distribution: [
+      { label: "Same day", count: 812 },
+      { label: "1-3 days", count: 486 },
+      { label: "4-7 days", count: 271 },
+      { label: "1-2 weeks", count: 158 },
+      { label: "2-4 weeks", count: 79 },
+      { label: "1+ months", count: 36 },
+    ],
+  };
 
   return {
     bySource,
     bySourceByStage,
     leadSources,
+    leadTimeToFirstConversion,
     utmCoverage: {
       withUtm: 1180,
       fallbackHeardAbout: 640,

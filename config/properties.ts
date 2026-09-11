@@ -84,26 +84,26 @@ export const YEAR_SOURCE = "derived_from_application_date" as const;
 export const YEARS_TRACKED = [2024, 2025, 2026] as const;
 
 // ---- Attribution ----
-// UTM property names not yet confirmed with the team — placeholders below,
-// flagged so they're easy to find and swap once confirmed.
-export const UTM_PROPERTIES = {
-  source: "utm_source", // TODO: confirm exact HubSpot internal property name
-  medium: "utm_medium", // TODO: confirm
-  campaign: "utm_campaign", // TODO: confirm
-};
-export const HEARD_ABOUT_PROPERTY = "heard_about";
-// Priority rule: use UTM data if present, else fall back to heard_about.
+// Confirmed with the team 2026-09-11:
+export const INITIAL_UTM_SOURCE_PROPERTY = "initial_utm_source"; // what we tracked via UTM
+export const HEARD_ABOUT_PROPERTY = "heard_about"; // what the contact says on the form
+// Priority rule: use initial_utm_source if present, else fall back to heard_about.
 
 // ---- Lead source (top-of-funnel, pre-application) ----
-// "Lead" stage contacts haven't applied yet - they came in through one of
-// three channels, per the original build brief.
-export const LEAD_SOURCE_VALUES = ["Tally Quiz", "Newsletter", "Meta Ad Form"] as const;
-// TODO: confirm with the team which HubSpot property or form-submission
-// association actually identifies which of these three a given "Lead"
-// stage contact came through. Likely candidates: a dedicated lead-source
-// property set at form submission, or (like the meeting-completion check
-// in lib/providers/hubspot.ts) inferring it from which specific form the
-// contact's earliest submission is associated with.
+// "Lead" stage contacts haven't applied yet - confirmed with the team they
+// come through exactly one of these two forms first.
+export const LEAD_SOURCE_FORM_NAMES = {
+  metaAds: "Meta Ads Lead",
+  newsletter: "Newsletter Fellowship New Website",
+} as const;
+export const LEAD_SOURCE_OTHER_LABEL = "Other / Unknown";
+// Classification property: HubSpot's standard "first_conversion_event_name"
+// contact property records the name of whichever form a contact first
+// submitted. This is a very standard HubSpot behavior, but NOT something
+// the team has explicitly confirmed - if this comes back empty or doesn't
+// match the two form names above, flag it back; the fallback would be the
+// same associations-based approach used for meeting-completion below.
+export const FIRST_CONVERSION_EVENT_PROPERTY = "first_conversion_event_name";
 
 // ---- Meetings ----
 // Meetings are logged as native HubSpot Meeting engagements associated

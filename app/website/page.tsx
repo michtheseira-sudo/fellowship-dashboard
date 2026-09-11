@@ -11,11 +11,13 @@ import {
   YAxis,
 } from "recharts";
 import DataError from "@/components/DataError";
-import type { WebsiteResponse } from "@/lib/types";
+import { toDisplayDate } from "@/lib/dateFormat";
+import type { WebsiteResponse, WebsitePeriodStats } from "@/lib/types";
 
 export default function WebsitePage() {
   const [data, setData] = useState<WebsiteResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [period, setPeriod] = useState<"thisWeek" | "thisMonth">("thisMonth");
 
   useEffect(() => {
     fetch("/api/website")
@@ -33,47 +35,83 @@ export default function WebsitePage() {
   if (error) return <div className="px-10 py-8"><DataError message={error} /></div>;
   if (!data) return <div className="px-10 py-8 text-sm text-muted">Loading…</div>;
 
+  const stats: WebsitePeriodStats = data[period];
+
   return (
     <div className="px-10 py-8 max-w-6xl">
-      <header className="mb-8">
-        <h1 className="font-head text-2xl font-semibold text-ink">Website Statistics</h1>
-        <p className="text-sm text-muted mt-1">GA4 traffic and behavior, with supplementary Shopify data.</p>
+      <header className="mb-6 flex items-baseline justify-between">
+        <div>
+          <h1 className="font-head text-2xl font-semibold text-ink">Website Statistics</h1>
+          <p className="text-sm text-muted mt-1">GA4 traffic and behavior, with supplementary Shopify data.</p>
+        </div>
+        <div className="flex gap-1">
+          <button
+            onClick={() => setPeriod("thisWeek")}
+            className={`px-3 py-1.5 text-sm border ${
+              period === "thisWeek" ? "border-brand1 text-brand1 bg-brand1-pastel" : "border-line text-muted"
+            }`}
+          >
+            This week
+          </button>
+          <button
+            onClick={() => setPeriod("thisMonth")}
+            className={`px-3 py-1.5 text-sm border ${
+              period === "thisMonth" ? "border-brand1 text-brand1 bg-brand1-pastel" : "border-line text-muted"
+            }`}
+          >
+            This month
+          </button>
+        </div>
       </header>
 
       <section className="grid grid-cols-3 gap-6 mb-10 border-b border-line pb-8">
-        <Stat label="Avg. session duration" value={`${Math.round(data.avgSessionDurationSeconds / 60)}m ${data.avgSessionDurationSeconds % 60}s`} />
-        <Stat label="Checkout starts (Shopify)" value={data.shopify.checkoutStarts.toLocaleString()} />
-        <Stat label="Checkout completions (Shopify)" value={data.shopify.checkoutCompletions.toLocaleString()} />
+        <Stat
+          label={`Avg. session duration — ${period === "thisWeek" ? "this week" : "this month"}`}
+          value={`${Math.round(stats.avgSessionDurationSeconds / 60)}m ${stats.avgSessionDurationSeconds % 60}s`}
+        />
+        <Stat label="Checkout starts (Shopify, all-time)" value={data.shopify.checkoutStarts.toLocaleString()} />
+        <Stat label="Checkout completions (Shopify, all-time)" value={data.shopify.checkoutCompletions.toLocaleString()} />
       </section>
 
       <div className="grid grid-cols-2 gap-6">
-        <Panel title="Visitors over time">
+        <Panel title="Visitors over time" subtitle="Last 12 weeks">
           <ResponsiveContainer width="100%" height={200}>
-            <BarChart data={data.visitorsOverTime.map((p) => ({ week: `W${p.weekOfSeason}`, visitors: p.value }))}>
+            <BarChart
+              data={data.visitorsOverTime.map((p) => ({
+                week: toDisplayDate(p.weekStartDate).slice(0, 5), // DD-MM, drop year for space
+                visitors: p.value,
+              }))}
+            >
               <CartesianGrid stroke="#E3E1E3" vertical={false} />
-              <XAxis dataKey="week" tick={{ fontSize: 11, fill: "#8A8288" }} axisLine={{ stroke: "#E3E1E3" }} tickLine={false} />
+              <XAxis dataKey="week" tick={{ fontSize: 10, fill: "#8A8288" }} axisLine={{ stroke: "#E3E1E3" }} tickLine={false} />
               <YAxis tick={{ fontSize: 11, fill: "#8A8288" }} axisLine={false} tickLine={false} />
-              <Tooltip contentStyle={{ border: "1px solid #E3E1E3", borderRadius: 2, fontSize: 12 }} />
+              <Tooltip
+                contentStyle={{ border: "1px solid #E3E1E3", borderRadius: 2, fontSize: 12 }}
+                labelFormatter={(label) => `Week of ${label}`}
+              />
               <Bar dataKey="visitors" fill="#78227b" />
             </BarChart>
           </ResponsiveContainer>
         </Panel>
 
-        <Panel title="Geography">
-          <ResponsiveContainer width="100%" height={200}>
-            <BarChart data={data.geography} layout="vertical" margin={{ left: 20 }}>
-              <CartesianGrid stroke="#E3E1E3" horizontal={false} />
-              <XAxis type="number" tick={{ fontSize: 11, fill: "#8A8288" }} axisLine={false} tickLine={false} />
-              <YAxis dataKey="country" type="category" tick={{ fontSize: 11, fill: "#8A8288" }} axisLine={false} tickLine={false} width={100} />
-              <Tooltip contentStyle={{ border: "1px solid #E3E1E3", borderRadius: 2, fontSize: 12 }} />
-              <Bar dataKey="sessions" fill="#8b818b" />
-            </BarChart>
-          </ResponsiveContainer>
+        <Panel title="Geography" subtitle={period === "thisWeek" ? "This week" : "This month"}>
+          {stats.geography.length === 0 ? (
+            <div className="text-sm text-muted py-4">No sessions with a known country in this period.</div>
+          ) : (
+            <ul className="text-sm divide-y divide-line">
+              {stats.geography.map((g) => (
+                <li key={g.country} className="flex justify-between py-2">
+                  <span className="text-ink">{g.country}</span>
+                  <span className="font-mono text-muted tabular">{g.sessions.toLocaleString()}</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </Panel>
 
-        <Panel title="Top pages">
+        <Panel title="Top pages" subtitle={period === "thisWeek" ? "This week" : "This month"}>
           <ul className="text-sm divide-y divide-line">
-            {data.topPages.map((p) => (
+            {stats.topPages.map((p) => (
               <li key={p.path} className="flex justify-between py-2">
                 <span className="text-ink">{p.path}</span>
                 <span className="font-mono text-muted tabular">{p.views.toLocaleString()}</span>
@@ -82,31 +120,39 @@ export default function WebsitePage() {
           </ul>
         </Panel>
 
-        <Panel title="Underperforming pages" subtitle="Below traffic threshold">
-          <ul className="text-sm divide-y divide-line">
-            {data.underperformingPages.map((p) => (
-              <li key={p.path} className="flex justify-between py-2">
-                <span className="text-ink">{p.path}</span>
-                <span className="font-mono text-danger tabular">
-                  {p.views} <span className="text-muted">/ {p.threshold}</span>
-                </span>
-              </li>
-            ))}
-          </ul>
+        <Panel title="Underperforming pages" subtitle="Below traffic threshold, this period">
+          {stats.underperformingPages.length === 0 ? (
+            <div className="text-sm text-muted py-4">None below threshold this period.</div>
+          ) : (
+            <ul className="text-sm divide-y divide-line">
+              {stats.underperformingPages.map((p) => (
+                <li key={p.path} className="flex justify-between py-2">
+                  <span className="text-ink">{p.path}</span>
+                  <span className="font-mono text-danger tabular">
+                    {p.views} <span className="text-muted">/ {p.threshold}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
         </Panel>
 
-        <Panel title="Top search keywords">
-          <ul className="text-sm divide-y divide-line">
-            {data.topKeywords.map((k) => (
-              <li key={k.keyword} className="flex justify-between py-2">
-                <span className="text-ink">{k.keyword}</span>
-                <span className="font-mono text-muted tabular">{k.clicks.toLocaleString()}</span>
-              </li>
-            ))}
-          </ul>
+        <Panel title="Top search keywords" subtitle={period === "thisWeek" ? "This week" : "This month"}>
+          {stats.topKeywords.length === 0 ? (
+            <div className="text-sm text-muted py-4">No Search Console data linked, or none this period.</div>
+          ) : (
+            <ul className="text-sm divide-y divide-line">
+              {stats.topKeywords.map((k) => (
+                <li key={k.keyword} className="flex justify-between py-2">
+                  <span className="text-ink">{k.keyword}</span>
+                  <span className="font-mono text-muted tabular">{k.clicks.toLocaleString()}</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </Panel>
 
-        <Panel title="Top product page views" subtitle="Shopify">
+        <Panel title="Top product page views" subtitle="Shopify, all-time">
           <ul className="text-sm divide-y divide-line">
             {data.shopify.topProductViews.map((p) => (
               <li key={p.product} className="flex justify-between py-2">

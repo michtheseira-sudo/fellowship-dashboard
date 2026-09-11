@@ -1,19 +1,22 @@
 import {
   DEAL_PIPELINE_ID,
   DEAL_STAGE_CLOSED_LOST,
+  FIRST_CONVERSION_EVENT_PROPERTY,
   FUNNEL_STAGES,
   HEARD_ABOUT_PROPERTY,
+  INITIAL_UTM_SOURCE_PROPERTY,
+  LEAD_SOURCE_FORM_NAMES,
+  LEAD_SOURCE_OTHER_LABEL,
   LEAD_STATUS_PROPERTY,
   MEETING_COMPLETION_FORM_NAMES,
   MEETING_OUTCOME_NO_SHOW_VALUES,
   SEASON_PROPERTY,
-  UTM_PROPERTIES,
   YEARS_TRACKED,
 } from "@/config/properties";
 import { weekOfSeason, dateForWeekOfSeason } from "@/lib/weeks";
 import { toMonthlyPoints } from "@/lib/months";
 import { computePacing, computeFunnelDrip } from "@/lib/funnelAggregation";
-import type { AttributionResponse, DealsBreakdown, FunnelResponse, MeetingsBreakdown, Season, StageSeries, WeeklyPoint } from "@/lib/types";
+import type { AttributionResponse, DealsBreakdown, FunnelResponse, LeadTimeStats, MeetingsBreakdown, Season, StageSeries, WeeklyPoint } from "@/lib/types";
 
 const HUBSPOT_BASE_URL = "https://api.hubapi.com";
 
@@ -69,15 +72,16 @@ function hubspotHeaders() {
  */
 export async function fetchContactsByStage(season: Season, leadStatusValue: string) {
   const url = `${HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search`;
-  const properties = [
-    LEAD_STATUS_PROPERTY,
-    SEASON_PROPERTY,
-    "createdate",
-    UTM_PROPERTIES.source,
-    UTM_PROPERTIES.medium,
-    UTM_PROPERTIES.campaign,
-    HEARD_ABOUT_PROPERTY,
-  ];
+  // Only request what this function actually reads (createdate, for weekly
+  // bucketing) plus the two filter fields. Earlier versions also requested
+  // UTM_PROPERTIES/HEARD_ABOUT_PROPERTY here for a future attribution use
+  // case that was never built - those unconfirmed property names caused
+  // HubSpot's Search API to reject the *entire* request with a 400 (it
+  // hard-validates every property in this list exists). If a live
+  // getLiveAttribution() implementation needs those fields later, fetch
+  // them in a dedicated call once the real property names are confirmed -
+  // don't add them back here.
+  const properties = [LEAD_STATUS_PROPERTY, SEASON_PROPERTY, "createdate"];
 
   const allResults: any[] = [];
   let after: string | undefined = undefined;
@@ -435,14 +439,177 @@ export async function getLiveFunnel(season: Season): Promise<FunnelResponse> {
   };
 }
 
+/**
+ * Fetches ALL contacts (no season filter) with a given lead_status,
+ * requesting whatever extra properties the caller needs. Used for
+ * attribution, which aggregates across seasons - unlike
+ * fetchContactsByStage, which is season-scoped for the funnel tab.
+ */
+async function fetchAllContactsByLeadStatus(leadStatusValue: string, extraProperties: string[]) {
+  const url = `${HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search`;
+  const properties = [LEAD_STATUS_PROPERTY, ...extraProperties];
+  const allResults: any[] = [];
+  let after: string | undefined = undefined;
+  const MAX_PAGES = 50;
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const body: Record<string, unknown> = {
+      filterGroups: [{ filters: [{ propertyName: LEAD_STATUS_PROPERTY, operator: "EQ", value: leadStatusValue }] }],
+      properties,
+      limit: 100,
+    };
+    if (after) body.after = after;
+
+    const res = await fetch(url, { method: "POST", headers: hubspotHeaders(), body: JSON.stringify(body) });
+    if (!res.ok) {
+      throw new Error(
+        `HubSpot contacts search (attribution, ${leadStatusValue}) failed: ${res.status} ${await res.text()}`
+      );
+    }
+    const data = await res.json();
+    allResults.push(...(data.results ?? []));
+
+    after = data.paging?.next?.after;
+    if (!after) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  return allResults;
+}
+
+/** Priority rule: initial_utm_source if present, else heard_about, else "Unknown". */
+function resolveSource(contact: any): { source: string; hadUtm: boolean; hadHeardAbout: boolean } {
+  const utm = contact.properties?.[INITIAL_UTM_SOURCE_PROPERTY]?.trim();
+  const heardAbout = contact.properties?.[HEARD_ABOUT_PROPERTY]?.trim();
+  if (utm) return { source: utm, hadUtm: true, hadHeardAbout: !!heardAbout };
+  if (heardAbout) return { source: heardAbout, hadUtm: false, hadHeardAbout: true };
+  return { source: "Unknown", hadUtm: false, hadHeardAbout: false };
+}
+
+const ATTRIBUTION_STAGES = [
+  { key: "new_candidate", leadStatusValue: "New candidate" },
+  { key: "accepted_fellow", leadStatusValue: "Accepted Fellow" },
+  { key: "booked_fellow", leadStatusValue: "Booked Fellow" },
+  { key: "paying_fellow", leadStatusValue: "Paying Fellow" },
+  { key: "confirmed_fellow", leadStatusValue: "Confirmed Fellow" },
+] as const;
+
+const LEAD_TIME_PROPERTIES = ["hs_analytics_first_timestamp", "first_conversion_date"];
+const LEAD_TIME_BUCKET_ORDER = ["Same day", "1-3 days", "4-7 days", "1-2 weeks", "2-4 weeks", "1+ months"];
+
+function bucketLeadTimeDays(days: number): string {
+  if (days <= 0) return "Same day";
+  if (days <= 3) return "1-3 days";
+  if (days <= 7) return "4-7 days";
+  if (days <= 14) return "1-2 weeks";
+  if (days <= 30) return "2-4 weeks";
+  return "1+ months";
+}
+
+/**
+ * Time from a contact's first-ever site visit (hs_analytics_first_timestamp,
+ * a standard HubSpot analytics property) to their first form submission
+ * (first_conversion_date). Pulled across every funnel stage - not season-
+ * scoped, since this is about browsing behavior before conversion, not
+ * program performance.
+ */
+async function computeLeadTimeToFirstConversion(): Promise<LeadTimeStats> {
+  const allStageValues = FUNNEL_STAGES.map((s) => s.leadStatusValue);
+  const results = await Promise.all(
+    allStageValues.map((v) => fetchAllContactsByLeadStatus(v, LEAD_TIME_PROPERTIES))
+  );
+  const contacts = results.flat();
+
+  const days: number[] = [];
+  for (const c of contacts) {
+    const firstSeen = c.properties?.hs_analytics_first_timestamp;
+    const converted = c.properties?.first_conversion_date;
+    if (!firstSeen || !converted) continue;
+    const t1 = new Date(firstSeen).getTime();
+    const t2 = new Date(converted).getTime();
+    if (isNaN(t1) || isNaN(t2)) continue;
+    const diffDays = Math.floor((t2 - t1) / 86400000);
+    if (diffDays < 0) continue; // guards against bad/backfilled data
+    days.push(diffDays);
+  }
+
+  const bucketCounts: Record<string, number> = {};
+  for (const label of LEAD_TIME_BUCKET_ORDER) bucketCounts[label] = 0;
+  for (const d of days) bucketCounts[bucketLeadTimeDays(d)]++;
+  const distribution = LEAD_TIME_BUCKET_ORDER.map((label) => ({ label, count: bucketCounts[label] }));
+
+  if (days.length === 0) {
+    return { averageDays: 0, medianDays: 0, sampleSize: 0, distribution };
+  }
+
+  const averageDays = Math.round((days.reduce((s, d) => s + d, 0) / days.length) * 10) / 10;
+  const sorted = [...days].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const medianDays =
+    sorted.length % 2 ? sorted[mid] : Math.round(((sorted[mid - 1] + sorted[mid]) / 2) * 10) / 10;
+
+  return { averageDays, medianDays, sampleSize: days.length, distribution };
+}
+
 export async function getLiveAttribution(): Promise<AttributionResponse> {
-  // TODO: implement once UTM property names are confirmed with the team
-  // (see config/properties.ts UTM_PROPERTIES - currently placeholders).
-  // Priority rule to apply per-contact: use UTM source if present and
-  // non-empty, else fall back to HEARD_ABOUT_PROPERTY value.
-  //
-  // Also needs leadSources (Tally Quiz / Newsletter / Meta Ad Form counts
-  // for "Lead" stage contacts) - see config/properties.ts LEAD_SOURCE_VALUES
-  // for the still-unconfirmed classification question.
-  throw new Error("getLiveAttribution is not implemented yet — see TODOs in this file.");
+  const extraProps = [INITIAL_UTM_SOURCE_PROPERTY, HEARD_ABOUT_PROPERTY];
+
+  // Fetch every stage's contacts in parallel, each tagged with a source.
+  const stageResults = await Promise.all(
+    ATTRIBUTION_STAGES.map(async (stage) => {
+      const contacts = await fetchAllContactsByLeadStatus(stage.leadStatusValue, extraProps);
+      return { key: stage.key, contacts: contacts.map(resolveSource) };
+    })
+  );
+
+  const allSources = new Set<string>();
+  for (const s of stageResults) for (const c of s.contacts) allSources.add(c.source);
+
+  const countsByStage: Record<string, Record<string, number>> = {};
+  for (const s of stageResults) {
+    const counts: Record<string, number> = {};
+    for (const source of allSources) counts[source] = 0;
+    for (const c of s.contacts) counts[c.source] += 1;
+    countsByStage[s.key] = counts;
+  }
+
+  const bySourceByStage = Array.from(allSources).map((source) => ({
+    source,
+    new_candidate: countsByStage.new_candidate[source] ?? 0,
+    accepted_fellow: countsByStage.accepted_fellow[source] ?? 0,
+    booked_fellow: countsByStage.booked_fellow[source] ?? 0,
+    paying_fellow: countsByStage.paying_fellow[source] ?? 0,
+    confirmed_fellow: countsByStage.confirmed_fellow[source] ?? 0,
+  }));
+
+  const bySource = bySourceByStage.map((row) => ({ source: row.source, applicants: row.new_candidate }));
+
+  // UTM coverage is measured at the top of the funnel (New Candidate).
+  const topOfFunnel = stageResults.find((s) => s.key === "new_candidate")?.contacts ?? [];
+  const utmCoverage = {
+    withUtm: topOfFunnel.filter((c) => c.hadUtm).length,
+    fallbackHeardAbout: topOfFunnel.filter((c) => !c.hadUtm && c.hadHeardAbout).length,
+    neither: topOfFunnel.filter((c) => !c.hadUtm && !c.hadHeardAbout).length,
+  };
+
+  // Lead sources: classify "Lead" stage contacts by first-form-submitted.
+  const leadContacts = await fetchAllContactsByLeadStatus("Lead", [FIRST_CONVERSION_EVENT_PROPERTY]);
+  let metaCount = 0;
+  let newsletterCount = 0;
+  let otherCount = 0;
+  for (const contact of leadContacts) {
+    const formName = contact.properties?.[FIRST_CONVERSION_EVENT_PROPERTY]?.trim();
+    if (formName === LEAD_SOURCE_FORM_NAMES.metaAds) metaCount++;
+    else if (formName === LEAD_SOURCE_FORM_NAMES.newsletter) newsletterCount++;
+    else otherCount++;
+  }
+  const leadSources = [
+    { source: LEAD_SOURCE_FORM_NAMES.metaAds, count: metaCount },
+    { source: LEAD_SOURCE_FORM_NAMES.newsletter, count: newsletterCount },
+    { source: LEAD_SOURCE_OTHER_LABEL, count: otherCount },
+  ];
+
+  const leadTimeToFirstConversion = await computeLeadTimeToFirstConversion();
+
+  return { bySource, bySourceByStage, leadSources, utmCoverage, leadTimeToFirstConversion };
 }
