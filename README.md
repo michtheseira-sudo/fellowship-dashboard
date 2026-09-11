@@ -58,17 +58,43 @@ unset for local dev. If the team already has SSO (Google Workspace, etc.),
 swap this for a proper auth provider instead — Basic Auth is a shared
 password, not per-person access.
 
-## Scheduled sync (Vercel Cron)
+## Scheduled sync (Vercel Blob + Cron) - IMPORTANT SETUP STEP
 
-`vercel.json` schedules `app/api/cron/sync/route.ts` to run nightly at
-02:00 UTC once deployed — this is the production path for the "sync
-nightly, don't hit APIs live on every page load" pattern from the brief.
-Set `CRON_SECRET` in Vercel (Vercel sets the matching bearer token on its
-own cron requests automatically). The route is wired up and safe to
-deploy now — it no-ops while `USE_MOCK_DATA=true` — but the actual
-HubSpot/GA4 pull-and-store logic inside it is still a `TODO`, same as the
-provider files. `scripts/sync.ts` is the equivalent for running the same
-job manually from your machine while testing.
+Live mode (`USE_MOCK_DATA=false`) does **not** call HubSpot/GA4/Shopify on
+every page load. Instead:
+
+- Every Sunday evening (`vercel.json`: `"0 20 * * 0"`, ~21:00-22:00 Rome
+  time depending on DST), Vercel Cron hits `/api/cron/sync`, which pulls
+  fresh data from every source and saves it to **Vercel Blob** storage
+  (`lib/liveSync.ts`, `lib/blobCache.ts`).
+- Every normal page load reads that saved snapshot instead - fast, and
+  doesn't hit any rate limits no matter how many people check the
+  dashboard that week.
+- A **"Refresh now" button** in the sidebar (`components/SyncStatus.tsx`)
+  lets anyone trigger the same sync on demand, for whenever Sunday's
+  snapshot isn't fresh enough - e.g. right before a Monday meeting, or
+  after fixing a HubSpot config issue and wanting to see it reflected
+  immediately rather than waiting for next Sunday.
+
+**Required one-time setup in Vercel (can't be done from code):** go to
+your Vercel project → **Storage** tab → **Create Database** → **Blob** →
+follow the prompts to connect it to this project. Vercel auto-generates
+and injects the `BLOB_READ_WRITE_TOKEN` env var itself - nothing to
+copy-paste. Without this, live mode will fail with "No synced data yet"
+on every page, since there's nowhere for the sync job to write to.
+
+An earlier version of this used SQLite (`lib/db.ts`) for this same
+purpose - that approach was scrapped because Vercel's serverless
+functions don't share a persistent filesystem between invocations, so a
+SQLite file written by one request wouldn't reliably still be there for
+the next one. Vercel Blob is Vercel's own storage product, built for
+exactly this kind of "write occasionally, read often" pattern.
+
+Set `CRON_SECRET` in Vercel once things are working (Vercel signs its own
+cron requests with the matching bearer token automatically) so the
+scheduled endpoint can't be triggered by anyone who finds the URL. The
+manual "Refresh now" button doesn't need this separately - it's already
+behind the app's own Basic Auth login.
 
 ## Recent changes (brand colors, weekly cadence, funnel drip, deals/meetings)
 
@@ -175,20 +201,22 @@ true for that to work correctly:
 6. **Shopify scope** — which specific Shopify metrics matter beyond GA4
    (checkout funnel, product/variant views) is still to be confirmed with
    the team; `lib/providers/shopify.ts` covers the most likely candidates.
-7. **Scheduled sync** — `scripts/sync.ts` is a scaffold for a nightly job
-   (cron / Vercel Cron / GitHub Action) that would populate `lib/db.ts`'s
-   SQLite tables, so the dashboard reads from local storage instead of
-   hitting HubSpot/GA4 on every page load. Not yet wired to real provider
-   calls — do this once items 1–5 above are resolved.
+7. **Vercel Blob store** — the one setup step that can't be done from
+   code: create + connect a Blob store in Vercel's dashboard (Storage tab).
+   See "Scheduled sync" section above. Without this, live mode fails with
+   "No synced data yet" on every page, since the weekly sync has nowhere
+   to write its results.
 
 ## Project structure
 
 ```
 app/            Next.js pages + API routes (one per tab, mirrored by /api/*)
-components/     Sidebar, filter bar, charts, pacing card
+components/     Sidebar, sync status/refresh button, filter bar, charts, pacing card
 config/         properties.ts (HubSpot mapping), goals.json (editable targets)
 lib/            types, mock data generator, week-alignment helper, data provider switch
-lib/providers/  real HubSpot / GA4 / Shopify clients (stubbed, TODO-flagged)
-scripts/sync.ts Nightly sync scaffold
-data/           SQLite file lives here once real sync runs (gitignored)
+lib/providers/  real HubSpot / GA4 / Shopify clients
+lib/blobCache.ts    Vercel Blob read/write helpers
+lib/liveSync.ts     the actual weekly sync job (pulls live data, writes to Blob)
+app/api/cron/sync/    scheduled entry point (Vercel Cron, Sundays)
+app/api/sync-now/     manual entry point ("Refresh now" button)
 ```

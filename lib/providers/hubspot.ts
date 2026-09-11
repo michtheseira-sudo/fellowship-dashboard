@@ -8,10 +8,42 @@ import {
   MEETING_OUTCOME_NO_SHOW_VALUES,
   SEASON_PROPERTY,
   UTM_PROPERTIES,
+  YEARS_TRACKED,
 } from "@/config/properties";
-import type { AttributionResponse, FunnelResponse, Season } from "@/lib/types";
+import { weekOfSeason, dateForWeekOfSeason } from "@/lib/weeks";
+import { toMonthlyPoints } from "@/lib/months";
+import { computePacing, computeFunnelDrip } from "@/lib/funnelAggregation";
+import type { AttributionResponse, DealsBreakdown, FunnelResponse, MeetingsBreakdown, Season, StageSeries, WeeklyPoint } from "@/lib/types";
 
 const HUBSPOT_BASE_URL = "https://api.hubapi.com";
+
+/**
+ * Buckets a list of dates into WeeklyPoint[] aligned to the given season's
+ * week-of-season numbering (same alignment mock data uses, so real and
+ * mock data overlay identically on the year-on-year charts). Year is the
+ * calendar year of each date - see config/properties.ts YEAR_SOURCE for
+ * why (no dedicated "year" property confirmed yet).
+ */
+function datesToWeeklyPoints(dates: Date[], season: Season): WeeklyPoint[] {
+  const counts = new Map<string, number>();
+  for (const date of dates) {
+    const year = date.getFullYear();
+    const week = weekOfSeason(date, season as "Summer" | "Winter", year);
+    if (week < 1) continue; // before this season's window - ignore
+    const key = `${year}-${week}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+
+  const points: WeeklyPoint[] = [];
+  for (const [key, value] of counts.entries()) {
+    const [yearStr, weekStr] = key.split("-");
+    const year = Number(yearStr);
+    const weekOfSeasonNum = Number(weekStr);
+    const weekStartDate = dateForWeekOfSeason(weekOfSeasonNum, season as "Summer" | "Winter", year);
+    points.push({ weekOfSeason: weekOfSeasonNum, weekStartDate: weekStartDate.toISOString().slice(0, 10), year, value });
+  }
+  return points.sort((a, b) => a.year - b.year || a.weekOfSeason - b.weekOfSeason);
+}
 
 function hubspotHeaders() {
   const token = process.env.HUBSPOT_PRIVATE_APP_TOKEN;
@@ -207,6 +239,43 @@ async function fetchMeetingFormAssociations(meetingIds: string[]): Promise<Map<s
  * Fetch meetings, classifying completion by associated form name and
  * outcome by the confirmed no-show/canceled values.
  */
+/**
+ * All deals created in the pipeline, regardless of current stage - used
+ * for the "Deals Created" weekly metric (as opposed to fetchDealsByStage,
+ * which is used for the Closed Won / Closed Lost breakdown specifically).
+ */
+export async function fetchAllDealsInPipeline() {
+  if (!DEAL_PIPELINE_ID) {
+    throw new Error("DEAL_PIPELINE_ID is not set in .env.local.");
+  }
+  const url = `${HUBSPOT_BASE_URL}/crm/v3/objects/deals/search`;
+  const allResults: any[] = [];
+  let after: string | undefined = undefined;
+  const MAX_PAGES = 50;
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const body: Record<string, unknown> = {
+      filterGroups: [{ filters: [{ propertyName: "pipeline", operator: "EQ", value: DEAL_PIPELINE_ID }] }],
+      properties: ["dealstage", "createdate", "closedate"],
+      limit: 100,
+    };
+    if (after) body.after = after;
+
+    const res = await fetch(url, { method: "POST", headers: hubspotHeaders(), body: JSON.stringify(body) });
+    if (!res.ok) {
+      throw new Error(`HubSpot deals search (all pipeline) failed: ${res.status} ${await res.text()}`);
+    }
+    const data = await res.json();
+    allResults.push(...(data.results ?? []));
+
+    after = data.paging?.next?.after;
+    if (!after) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  return { results: allResults, total: allResults.length };
+}
+
 export async function fetchMeetings() {
   const url = `${HUBSPOT_BASE_URL}/crm/v3/objects/meetings/search`;
   const allResults: any[] = [];
@@ -257,23 +326,113 @@ export async function fetchMeetings() {
 }
 
 export async function getLiveFunnel(season: Season): Promise<FunnelResponse> {
-  // TODO: implement full live aggregation once credentials are available:
-  // 1. For each FUNNEL_STAGES entry, call fetchContactsByStage and bucket
-  //    results by week (using createdate) and year.
-  // 2. Call fetchDealsByStage for each mapped dealStageValue.
-  // 3. Call fetchMeetings, split into booked (all) vs completed (per form
-  //    association) vs no-show/canceled.
-  // 4. Assemble into the FunnelResponse shape (see lib/types.ts) - same
-  //    shape the mock data returns, so downstream UI code doesn't change.
-  //    This now also includes funnelDrip (stage-to-stage conversion),
-  //    deals (won vs lost by month), and meetings (booked vs completed
-  //    with a completion rate) - see lib/mockData.ts computeFunnelDrip /
-  //    computeDealsBreakdown / computeMeetingsBreakdown for the exact
-  //    aggregation logic to mirror against live data.
-  throw new Error(
-    "getLiveFunnel is not implemented yet — set USE_MOCK_DATA=true, or finish wiring this " +
-      "function once HubSpot credentials are confirmed working (see TODOs in this file)."
+  const currentYear = new Date().getFullYear();
+  const years = [...YEARS_TRACKED];
+
+  // 1. One stage-count series per FUNNEL_STAGES entry, from real contacts.
+  const stages: StageSeries[] = [];
+  for (const stageDef of FUNNEL_STAGES) {
+    const { results } = await fetchContactsByStage(season, stageDef.leadStatusValue);
+    const dates = results
+      .map((r: any) => r.properties?.createdate)
+      .filter(Boolean)
+      .map((d: string) => new Date(d));
+    stages.push({
+      stageKey: stageDef.key,
+      label: stageDef.label,
+      points: datesToWeeklyPoints(dates, season),
+    });
+  }
+
+  // 2. Deals: Closed Won / Closed Lost (real outcomes, not simulated) plus
+  // all-pipeline "Deals Created".
+  const wonDeals = await fetchDealsByStage("Closed won");
+  const lostDeals = await fetchDealsByStage(DEAL_STAGE_CLOSED_LOST);
+  const allDeals = await fetchAllDealsInPipeline();
+
+  const wonPoints = datesToWeeklyPoints(
+    wonDeals.results.map((d: any) => new Date(d.properties?.createdate)).filter((d: Date) => !isNaN(d.getTime())),
+    season
   );
+  const lostPoints = datesToWeeklyPoints(
+    lostDeals.results.map((d: any) => new Date(d.properties?.createdate)).filter((d: Date) => !isNaN(d.getTime())),
+    season
+  );
+  const dealsCreatedPoints = datesToWeeklyPoints(
+    allDeals.results.map((d: any) => new Date(d.properties?.createdate)).filter((d: Date) => !isNaN(d.getTime())),
+    season
+  );
+
+  const monthlyWon = toMonthlyPoints(wonPoints);
+  const monthlyLost = toMonthlyPoints(lostPoints);
+  const dealsMonthly = monthlyWon.map((m) => {
+    const lostMatch = monthlyLost.find((l) => l.monthIndex === m.monthIndex && l.year === m.year);
+    return { monthIndex: m.monthIndex, monthLabel: m.monthLabel, year: m.year, won: m.value, lost: lostMatch?.value ?? 0 };
+  });
+  const totalWon = dealsMonthly.reduce((s, m) => s + m.won, 0);
+  const totalLost = dealsMonthly.reduce((s, m) => s + m.lost, 0);
+  const currentYearLostSorted = lostPoints.filter((p) => p.year === currentYear).sort((a, b) => a.weekOfSeason - b.weekOfSeason);
+  const currentYearWonSorted = wonPoints.filter((p) => p.year === currentYear).sort((a, b) => a.weekOfSeason - b.weekOfSeason);
+  const thisWeekLost = currentYearLostSorted.at(-1)?.value ?? 0;
+  const lastWeekLost = currentYearLostSorted.at(-2)?.value ?? 0;
+  const thisWeekWon = currentYearWonSorted.at(-1)?.value ?? 0;
+  const lastWeekWon = currentYearWonSorted.at(-2)?.value ?? 0;
+
+  const deals: DealsBreakdown = {
+    monthly: dealsMonthly,
+    totalWon,
+    totalLost,
+    winRate: totalWon / (totalWon + totalLost || 1),
+    thisWeekWon,
+    lastWeekWon,
+    thisWeekLost,
+    lastWeekLost,
+    weekOverWeekLostDelta: thisWeekLost - lastWeekLost,
+  };
+
+  // 3. Meetings: booked (all) vs completed (per form-association check).
+  const allMeetings = await fetchMeetings();
+  const meetingDates = (m: any) => {
+    const raw = m.properties?.hs_meeting_start_time;
+    return raw ? new Date(raw) : null;
+  };
+  const bookedDates = allMeetings.map(meetingDates).filter((d): d is Date => d !== null && !isNaN(d.getTime()));
+  const completedDates = allMeetings
+    .filter((m: any) => m.completed)
+    .map(meetingDates)
+    .filter((d): d is Date => d !== null && !isNaN(d.getTime()));
+
+  const weeklyBookedPoints = datesToWeeklyPoints(bookedDates, season);
+  const weeklyCompletedPoints = datesToWeeklyPoints(completedDates, season);
+  const totalBooked = weeklyBookedPoints.filter((p) => p.year === currentYear).reduce((s, p) => s + p.value, 0);
+  const totalCompleted = weeklyCompletedPoints.filter((p) => p.year === currentYear).reduce((s, p) => s + p.value, 0);
+
+  const meetings: MeetingsBreakdown = {
+    monthlyBooked: weeklyBookedPoints,
+    monthlyCompleted: weeklyCompletedPoints,
+    totalBooked,
+    totalCompleted,
+    completionRate: totalCompleted / (totalBooked || 1),
+  };
+
+  // 4. Pacing and funnel drip - identical logic to mock data, shared module.
+  const pacing = computePacing(season, stages, currentYear);
+  const funnelDrip = computeFunnelDrip(stages, currentYear);
+
+  return {
+    season,
+    years,
+    stages,
+    extras: {
+      dealsCreated: { stageKey: "deals_created", label: "Deals Created", points: dealsCreatedPoints },
+      meetingsBooked: { stageKey: "meetings_booked", label: "Meetings Booked", points: weeklyBookedPoints },
+      meetingsCompleted: { stageKey: "meetings_completed", label: "Meetings Completed", points: weeklyCompletedPoints },
+    },
+    pacing,
+    funnelDrip,
+    deals,
+    meetings,
+  };
 }
 
 export async function getLiveAttribution(): Promise<AttributionResponse> {

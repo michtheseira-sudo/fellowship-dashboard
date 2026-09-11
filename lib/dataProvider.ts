@@ -1,7 +1,5 @@
 import { getMockAttribution, getMockFunnel, getMockWebsite } from "@/lib/mockData";
-import { getLiveAttribution, getLiveFunnel } from "@/lib/providers/hubspot";
-import { getLiveWebsiteStats } from "@/lib/providers/ga4";
-import { getLiveShopifyStats } from "@/lib/providers/shopify";
+import { CACHE_KEYS, readCachedJSON } from "@/lib/blobCache";
 import type { AttributionResponse, FunnelResponse, Season, WebsiteResponse } from "@/lib/types";
 
 function useMock(): boolean {
@@ -9,34 +7,27 @@ function useMock(): boolean {
   return process.env.USE_MOCK_DATA !== "false";
 }
 
+const NOT_SYNCED_MESSAGE =
+  "No synced data yet. Click \"Refresh now\" in the sidebar, or wait for the next " +
+  "scheduled sync (Sunday evenings) - see lib/liveSync.ts for what the sync actually does.";
+
 export async function getFunnelData(season: Season): Promise<FunnelResponse> {
   if (useMock()) return getMockFunnel(season);
-  return getLiveFunnel(season);
+  const cached = await readCachedJSON<FunnelResponse>(CACHE_KEYS.funnel(season));
+  if (!cached) throw new Error(NOT_SYNCED_MESSAGE);
+  return cached;
 }
 
 export async function getWebsiteData(): Promise<WebsiteResponse> {
   if (useMock()) return getMockWebsite();
-
-  const ga4 = await getLiveWebsiteStats();
-
-  // Shopify is supplementary per the brief - if its scope isn't confirmed
-  // yet or the call fails, fall back to zeroed Shopify figures rather than
-  // failing the whole tab, since GA4 data alone is still useful.
-  let shopify: WebsiteResponse["shopify"] = {
-    checkoutStarts: 0,
-    checkoutCompletions: 0,
-    topProductViews: [],
-  };
-  try {
-    shopify = await getLiveShopifyStats();
-  } catch (err: any) {
-    console.error("[dataProvider] Shopify fetch failed, continuing with GA4-only data:", err.message);
-  }
-
-  return { ...ga4, shopify };
+  const cached = await readCachedJSON<WebsiteResponse>(CACHE_KEYS.website);
+  if (!cached) throw new Error(NOT_SYNCED_MESSAGE);
+  return cached;
 }
 
 export async function getAttributionData(): Promise<AttributionResponse> {
   if (useMock()) return getMockAttribution();
-  return getLiveAttribution();
+  const cached = await readCachedJSON<AttributionResponse>(CACHE_KEYS.attribution);
+  if (!cached) throw new Error(NOT_SYNCED_MESSAGE);
+  return cached;
 }

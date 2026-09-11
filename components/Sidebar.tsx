@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import SyncStatus from "@/components/SyncStatus";
 
 const NAV_ITEMS = [
   { href: "/funnel", label: "Funnel / KPIs", index: "01" },
@@ -44,14 +45,7 @@ export default function Sidebar() {
         })}
       </nav>
 
-      <div className="mt-auto pt-8 border-t border-line text-xs text-muted leading-relaxed">
-        Data source:{" "}
-        <span className="font-mono">
-          {process.env.NEXT_PUBLIC_DATA_MODE ?? "mock"}
-        </span>
-        <br />
-        Set USE_MOCK_DATA=false once HubSpot / GA4 credentials are live.
-      </div>
+      <SyncStatus />
     </aside>
   );
 }
