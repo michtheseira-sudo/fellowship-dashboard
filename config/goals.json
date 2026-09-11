@@ -1,0 +1,22 @@
+{
+  "Summer-2026": {
+    "seasonDeadline": "2026-06-01",
+    "targets": {
+      "new_candidate": 1200,
+      "accepted_fellow": 450,
+      "booked_fellow": 300,
+      "paying_fellow": 280,
+      "confirmed_fellow": 260
+    }
+  },
+  "Winter-2026": {
+    "seasonDeadline": "2026-12-01",
+    "targets": {
+      "new_candidate": 700,
+      "accepted_fellow": 260,
+      "booked_fellow": 170,
+      "paying_fellow": 160,
+      "confirmed_fellow": 150
+    }
+  }
+}
