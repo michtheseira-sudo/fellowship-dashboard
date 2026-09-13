@@ -83,7 +83,7 @@ export const DEAL_STAGE_CLOSED_LOST = "166592749"; // "Closed lost"
 
 // ---- Season / Year ----
 export const SEASON_PROPERTY = "season";
-export const SEASON_VALUES = ["Summer", "Winter", "Undecided"] as const;
+export const SEASON_VALUES = ["Summer", "Winter", "Other"] as const;
 
 // No dedicated "year" property confirmed yet — derive year from the
 // application/form-submission date until a clean property is confirmed.

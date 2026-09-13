@@ -1,6 +1,6 @@
-import { getMockAttribution, getMockFunnel, getMockWebsite } from "@/lib/mockData";
+import { getMockApplications, getMockAttribution, getMockFunnel, getMockWebsite } from "@/lib/mockData";
 import { CACHE_KEYS, readCachedJSON } from "@/lib/blobCache";
-import type { AttributionResponse, FunnelResponse, Season, WebsiteResponse } from "@/lib/types";
+import type { ApplicationsBreakdown, AttributionResponse, FunnelResponse, Season, WebsiteResponse } from "@/lib/types";
 
 function useMock(): boolean {
   // Defaults to true (safe) if the env var is missing entirely.
@@ -14,6 +14,13 @@ const NOT_SYNCED_MESSAGE =
 export async function getFunnelData(season: Season): Promise<FunnelResponse> {
   if (useMock()) return getMockFunnel(season);
   const cached = await readCachedJSON<FunnelResponse>(CACHE_KEYS.funnel(season));
+  if (!cached) throw new Error(NOT_SYNCED_MESSAGE);
+  return cached;
+}
+
+export async function getApplicationsData(): Promise<ApplicationsBreakdown> {
+  if (useMock()) return getMockApplications();
+  const cached = await readCachedJSON<ApplicationsBreakdown>(CACHE_KEYS.applications);
   if (!cached) throw new Error(NOT_SYNCED_MESSAGE);
   return cached;
 }

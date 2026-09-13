@@ -11,12 +11,25 @@ import {
   MEETING_COMPLETION_FORM_NAMES,
   MEETING_OUTCOME_NO_SHOW_VALUES,
   SEASON_PROPERTY,
+  SEASON_VALUES,
   YEARS_TRACKED,
 } from "@/config/properties";
 import { weekOfSeason, dateForWeekOfSeason } from "@/lib/weeks";
 import { toMonthlyPoints } from "@/lib/months";
 import { computePacing, computeFunnelDrip } from "@/lib/funnelAggregation";
-import type { AttributionResponse, DealsBreakdown, FunnelResponse, LeadTimeStats, MeetingsBreakdown, Season, StageSeries, WeeklyPoint } from "@/lib/types";
+import type { ApplicationsBreakdown, AttributionResponse, DealsBreakdown, FunnelResponse, LeadTimeStats, MeetingsBreakdown, Season, StageSeries, WeeklyPoint } from "@/lib/types";
+
+/**
+ * HubSpot's Search API has a strict per-second ("SECONDLY") rate limit on
+ * lower-tier plans - tighter than the general API limit. This sync job
+ * makes many search calls in a short window (one per pipeline stage, plus
+ * deals, plus several for attribution), so every one of them - not just
+ * pagination within a single call - needs spacing to avoid 429s.
+ */
+const RATE_LIMIT_DELAY_MS = 550;
+function rateLimitDelay() {
+  return new Promise((r) => setTimeout(r, RATE_LIMIT_DELAY_MS));
+}
 
 const HUBSPOT_BASE_URL = "https://api.hubapi.com";
 
@@ -62,63 +75,138 @@ function hubspotHeaders() {
 }
 
 /**
- * Fetch contacts filtered by season + lead_status, paginated.
- * TODO before first real run:
- *  - Confirm the deal pipeline ID that contains "Invited to enroll",
- *    "Paid deposit", "Paid installment", "Closed won", "Closed lost".
- *  - Confirm whether "year" should be read from a property or derived
- *    from the application/form-submission timestamp (current assumption:
- *    derive from date - see config/properties.ts YEAR_SOURCE).
+ * Fetch every contact ID across ALL season values in ONE search (not one
+ * call per season) - this is the expensive part of a sync (batch-reading
+ * everyone's full history afterward), so doing the roster fetch once
+ * instead of three times (Summer/Winter/Other) roughly triples the
+ * savings compared to a naive per-season loop. Each contact comes back
+ * tagged with its own season value so callers can split the group
+ * locally afterward.
  */
-export async function fetchContactsByStage(season: Season, leadStatusValue: string) {
+async function fetchAllContactsRoster(): Promise<{ id: string; season: Season }[]> {
   const url = `${HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search`;
-  // Only request what this function actually reads (createdate, for weekly
-  // bucketing) plus the two filter fields. Earlier versions also requested
-  // UTM_PROPERTIES/HEARD_ABOUT_PROPERTY here for a future attribution use
-  // case that was never built - those unconfirmed property names caused
-  // HubSpot's Search API to reject the *entire* request with a 400 (it
-  // hard-validates every property in this list exists). If a live
-  // getLiveAttribution() implementation needs those fields later, fetch
-  // them in a dedicated call once the real property names are confirmed -
-  // don't add them back here.
-  const properties = [LEAD_STATUS_PROPERTY, SEASON_PROPERTY, "createdate"];
-
-  const allResults: any[] = [];
+  const roster: { id: string; season: Season }[] = [];
   let after: string | undefined = undefined;
-  const MAX_PAGES = 50; // safety cap (5,000 contacts) - raise if a single stage genuinely exceeds this
+  const MAX_PAGES = 50; // safety cap (5,000 contacts)
 
   for (let page = 0; page < MAX_PAGES; page++) {
     const body: Record<string, unknown> = {
-      filterGroups: [
-        {
-          filters: [
-            { propertyName: SEASON_PROPERTY, operator: "EQ", value: season },
-            { propertyName: LEAD_STATUS_PROPERTY, operator: "EQ", value: leadStatusValue },
-          ],
-        },
-      ],
-      properties,
+      filterGroups: [{ filters: [{ propertyName: SEASON_PROPERTY, operator: "IN", values: [...SEASON_VALUES] }] }],
+      properties: ["hs_object_id", SEASON_PROPERTY],
       limit: 100,
     };
     if (after) body.after = after;
 
     const res = await fetch(url, { method: "POST", headers: hubspotHeaders(), body: JSON.stringify(body) });
     if (!res.ok) {
-      throw new Error(`HubSpot contacts search failed: ${res.status} ${await res.text()}`);
+      throw new Error(`HubSpot contacts search (full roster) failed: ${res.status} ${await res.text()}`);
     }
     const data = await res.json();
-    allResults.push(...(data.results ?? []));
+    for (const r of data.results ?? []) {
+      const seasonValue = r.properties?.[SEASON_PROPERTY];
+      if ((SEASON_VALUES as readonly string[]).includes(seasonValue)) {
+        roster.push({ id: r.id, season: seasonValue as Season });
+      }
+      // A contact with a missing/unexpected season value is silently
+      // skipped here - same as before, but worth knowing about if
+      // application totals ever look low: it means some contacts have a
+      // season value outside Summer/Winter/Other entirely.
+    }
 
     after = data.paging?.next?.after;
     if (!after) break;
-
-    // HubSpot search API rate limit is generous but not unlimited - a small
-    // delay between pages avoids bursting on large result sets.
-    await new Promise((r) => setTimeout(r, 100));
+    await rateLimitDelay();
   }
 
-  return { results: allResults, total: allResults.length };
+  return roster;
 }
+
+/**
+ * Batch-reads a list of contact IDs with their FULL history on
+ * hs_lead_status (not just the current value) - this is what makes "ever
+ * reached this stage" possible even after a contact has moved on or
+ * closed lost. HubSpot's batch/read endpoint returns history newest-first
+ * per contact; we sort it ascending here so "first time they hit stage X"
+ * is a simple find().
+ *
+ * hs_lead_status has been in place well before this season (confirmed
+ * with the team - it's the same field Stripe/deal-stage automation
+ * writes to), so its history is trustworthy for this whole season. If a
+ * future season predates when this field went live, this approach would
+ * silently under-count early stages for that season only - worth
+ * re-checking if a much older season is ever added.
+ */
+async function fetchLeadStatusHistory(ids: string[]): Promise<Map<string, { value: string; timestamp: string }[]>> {
+  const url = `${HUBSPOT_BASE_URL}/crm/v3/objects/contacts/batch/read`;
+  const historyByContact = new Map<string, { value: string; timestamp: string }[]>();
+  const CHUNK_SIZE = 100; // HubSpot's batch/read max per request
+
+  for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+    const chunk = ids.slice(i, i + CHUNK_SIZE);
+    const body = {
+      inputs: chunk.map((id) => ({ id })),
+      propertiesWithHistory: [LEAD_STATUS_PROPERTY],
+    };
+    const res = await fetch(url, { method: "POST", headers: hubspotHeaders(), body: JSON.stringify(body) });
+    if (!res.ok) {
+      throw new Error(`HubSpot contacts batch/read (lead status history) failed: ${res.status} ${await res.text()}`);
+    }
+    const data = await res.json();
+    for (const contact of data.results ?? []) {
+      const rawHistory = contact.propertiesWithHistory?.[LEAD_STATUS_PROPERTY] ?? [];
+      const sorted = rawHistory
+        .map((h: any) => ({ value: h.value, timestamp: h.timestamp }))
+        .sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+      historyByContact.set(contact.id, sorted);
+    }
+    if (i + CHUNK_SIZE < ids.length) await rateLimitDelay();
+  }
+
+  return historyByContact;
+}
+
+/**
+ * Builds stage cohort data for EVERY season in one shared HubSpot pass:
+ * one combined roster fetch (Summer + Winter + Other together, not three
+ * separate season-scoped fetches) and one shared history batch-read,
+ * split into per-season buckets afterward in memory. For each season,
+ * this gives one Date[] per funnel stage: the date each contact FIRST
+ * reached that stage, for every contact who ever reached it - not just
+ * contacts currently sitting there. A contact who was Accepted, then
+ * Booked, then later Closed Lost still counts toward Accepted (and
+ * Booked) here, matching how HubSpot's own "ever equal to" segment
+ * filter would report it.
+ *
+ * This also gives us the "Other" (undecided-season) bucket essentially
+ * for free - useful for the Applications breakdown even though Other
+ * doesn't get its own goal-pacing cards (see getLiveApplications below).
+ */
+async function buildCohortsForAllSeasons(): Promise<Map<Season, Map<string, Date[]>>> {
+  const roster = await fetchAllContactsRoster();
+  await rateLimitDelay();
+  const historyByContact = await fetchLeadStatusHistory(roster.map((r) => r.id));
+
+  const cohortsBySeason = new Map<Season, Map<string, Date[]>>();
+  for (const season of SEASON_VALUES) {
+    const datesByStage = new Map<string, Date[]>();
+    for (const stageDef of FUNNEL_STAGES) datesByStage.set(stageDef.key, []);
+    cohortsBySeason.set(season, datesByStage);
+  }
+
+  for (const { id, season } of roster) {
+    const history = historyByContact.get(id);
+    if (!history) continue;
+    const datesByStage = cohortsBySeason.get(season)!;
+    for (const stageDef of FUNNEL_STAGES) {
+      const firstEntry = history.find((h) => h.value === stageDef.leadStatusValue);
+      if (firstEntry) datesByStage.get(stageDef.key)!.push(new Date(firstEntry.timestamp));
+    }
+  }
+
+  return cohortsBySeason;
+}
+
+
 
 /**
  * Fetch deals in a stage, filtered by created date range + season.
@@ -162,7 +250,7 @@ export async function fetchDealsByStage(dealStageValue: string) {
 
     after = data.paging?.next?.after;
     if (!after) break;
-    await new Promise((r) => setTimeout(r, 100));
+    await rateLimitDelay();
   }
 
   return { results: allResults, total: allResults.length };
@@ -205,7 +293,7 @@ async function fetchMeetingFormAssociations(meetingIds: string[]): Promise<Map<s
       const formId = entry.to?.[0]?.toObjectId;
       if (formId) result.set(entry.from.id, formId);
     }
-    await new Promise((r) => setTimeout(r, 100));
+    await rateLimitDelay();
   }
 
   // The associations endpoint gives form IDs, not names - resolve the
@@ -274,7 +362,7 @@ export async function fetchAllDealsInPipeline() {
 
     after = data.paging?.next?.after;
     if (!after) break;
-    await new Promise((r) => setTimeout(r, 100));
+    await rateLimitDelay();
   }
 
   return { results: allResults, total: allResults.length };
@@ -302,7 +390,7 @@ export async function fetchMeetings() {
 
     after = data.paging?.next?.after;
     if (!after) break;
-    await new Promise((r) => setTimeout(r, 100));
+    await rateLimitDelay();
   }
 
   const formAssociations = await fetchMeetingFormAssociations(allResults.map((m) => m.id));
@@ -329,34 +417,27 @@ export async function fetchMeetings() {
   return classified;
 }
 
-export async function getLiveFunnel(season: Season): Promise<FunnelResponse> {
-  const currentYear = new Date().getFullYear();
-  const years = [...YEARS_TRACKED];
-
-  // 1. One stage-count series per FUNNEL_STAGES entry, from real contacts.
-  const stages: StageSeries[] = [];
-  for (const stageDef of FUNNEL_STAGES) {
-    const { results } = await fetchContactsByStage(season, stageDef.leadStatusValue);
-    const dates = results
-      .map((r: any) => r.properties?.createdate)
-      .filter(Boolean)
-      .map((d: string) => new Date(d));
-    stages.push({
-      stageKey: stageDef.key,
-      label: stageDef.label,
-      points: datesToWeeklyPoints(dates, season),
-    });
-  }
-
-  // 2. Deals: Closed Won / Closed Lost (real outcomes, not simulated) plus
-  // all-pipeline "Deals Created". Closed Won's stage ID comes from
-  // FUNNEL_STAGES (confirmed_fellow) rather than being hardcoded here -
-  // this exact pattern (a second hardcoded copy silently drifting from
-  // the confirmed value) already caused two other bugs today.
-  const closedWonStageId = FUNNEL_STAGES.find((s) => s.key === "confirmed_fellow")!.dealStageValue!;
-  const wonDeals = await fetchDealsByStage(closedWonStageId);
-  const lostDeals = await fetchDealsByStage(DEAL_STAGE_CLOSED_LOST);
-  const allDeals = await fetchAllDealsInPipeline();
+/**
+ * Builds one season's full FunnelResponse from already-fetched shared
+ * data (cohort dates, deals, meetings) - no HubSpot calls happen in here,
+ * it's pure local bucketing/aggregation. Called once per season from
+ * getLiveFunnelBundle below.
+ */
+function buildFunnelResponseForSeason(
+  season: Season,
+  cohortDatesByStage: Map<string, Date[]>,
+  wonDeals: { results: any[] },
+  lostDeals: { results: any[] },
+  allDeals: { results: any[] },
+  allMeetings: any[],
+  currentYear: number,
+  years: number[]
+): FunnelResponse {
+  const stages: StageSeries[] = FUNNEL_STAGES.map((stageDef) => ({
+    stageKey: stageDef.key,
+    label: stageDef.label,
+    points: datesToWeeklyPoints(cohortDatesByStage.get(stageDef.key) ?? [], season),
+  }));
 
   const wonPoints = datesToWeeklyPoints(
     wonDeals.results.map((d: any) => new Date(d.properties?.createdate)).filter((d: Date) => !isNaN(d.getTime())),
@@ -398,8 +479,6 @@ export async function getLiveFunnel(season: Season): Promise<FunnelResponse> {
     weekOverWeekLostDelta: thisWeekLost - lastWeekLost,
   };
 
-  // 3. Meetings: booked (all) vs completed (per form-association check).
-  const allMeetings = await fetchMeetings();
   const meetingDates = (m: any) => {
     const raw = m.properties?.hs_meeting_start_time;
     return raw ? new Date(raw) : null;
@@ -423,7 +502,6 @@ export async function getLiveFunnel(season: Season): Promise<FunnelResponse> {
     completionRate: totalCompleted / (totalBooked || 1),
   };
 
-  // 4. Pacing and funnel drip - identical logic to mock data, shared module.
   const pacing = computePacing(season, stages, currentYear);
   const funnelDrip = computeFunnelDrip(stages, currentYear);
 
@@ -444,10 +522,80 @@ export async function getLiveFunnel(season: Season): Promise<FunnelResponse> {
 }
 
 /**
+ * The single entry point the sync job calls for funnel data. Fetches
+ * cohorts (all 3 season values), deals, and meetings EXACTLY ONCE each -
+ * none of these HubSpot queries are actually season-scoped server-side
+ * (deals/meetings never were; cohorts now cover all seasons in one pass
+ * too), so building Summer and Winter as two separate top-to-bottom live
+ * fetches was redoing the same work twice for no reason. Also returns
+ * the Applications breakdown (Summer/Winter/Other application counts)
+ * as a byproduct of the same cohort data, at no extra HubSpot cost.
+ */
+export async function getLiveFunnelBundle(): Promise<{
+  summer: FunnelResponse;
+  winter: FunnelResponse;
+  applications: ApplicationsBreakdown;
+}> {
+  const currentYear = new Date().getFullYear();
+  const years = [...YEARS_TRACKED];
+
+  const cohortsBySeason = await buildCohortsForAllSeasons();
+  await rateLimitDelay();
+
+  // Deals: Closed Won / Closed Lost (real outcomes, not simulated) plus
+  // all-pipeline "Deals Created". Closed Won's stage ID comes from
+  // FUNNEL_STAGES (confirmed_fellow) rather than being hardcoded here -
+  // this exact pattern (a second hardcoded copy silently drifting from
+  // the confirmed value) already caused two other bugs today.
+  const closedWonStageId = FUNNEL_STAGES.find((s) => s.key === "confirmed_fellow")!.dealStageValue!;
+  const wonDeals = await fetchDealsByStage(closedWonStageId);
+  await rateLimitDelay();
+  const lostDeals = await fetchDealsByStage(DEAL_STAGE_CLOSED_LOST);
+  await rateLimitDelay();
+  const allDeals = await fetchAllDealsInPipeline();
+  await rateLimitDelay();
+
+  // Meetings: booked (all) vs completed (per form-association check).
+  const allMeetings = await fetchMeetings();
+
+  const summer = buildFunnelResponseForSeason(
+    "Summer",
+    cohortsBySeason.get("Summer")!,
+    wonDeals,
+    lostDeals,
+    allDeals,
+    allMeetings,
+    currentYear,
+    years
+  );
+  const winter = buildFunnelResponseForSeason(
+    "Winter",
+    cohortsBySeason.get("Winter")!,
+    wonDeals,
+    lostDeals,
+    allDeals,
+    allMeetings,
+    currentYear,
+    years
+  );
+
+  const applications: ApplicationsBreakdown = {
+    summer: cohortsBySeason.get("Summer")!.get("new_candidate")?.length ?? 0,
+    winter: cohortsBySeason.get("Winter")!.get("new_candidate")?.length ?? 0,
+    other: cohortsBySeason.get("Other")!.get("new_candidate")?.length ?? 0,
+    asOf: new Date().toISOString(),
+  };
+
+  return { summer, winter, applications };
+}
+
+/**
  * Fetches ALL contacts (no season filter) with a given lead_status,
  * requesting whatever extra properties the caller needs. Used for
- * attribution, which aggregates across seasons - unlike
- * fetchContactsByStage, which is season-scoped for the funnel tab.
+ * attribution, which aggregates across seasons and only needs current
+ * status (unlike the funnel tab, which now tracks full stage history -
+ * see buildCohortsForAllSeasons - to capture contacts who moved on or
+ * closed lost).
  */
 async function fetchAllContactsByLeadStatus(leadStatusValue: string, extraProperties: string[]) {
   const url = `${HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search`;
@@ -475,7 +623,7 @@ async function fetchAllContactsByLeadStatus(leadStatusValue: string, extraProper
 
     after = data.paging?.next?.after;
     if (!after) break;
-    await new Promise((r) => setTimeout(r, 100));
+    await rateLimitDelay();
   }
 
   return allResults;
@@ -522,9 +670,11 @@ function bucketLeadTimeDays(days: number): string {
  */
 async function computeLeadTimeToFirstConversion(): Promise<LeadTimeStats> {
   const allStageValues = FUNNEL_STAGES.map((s) => s.leadStatusValue);
-  const results = await Promise.all(
-    allStageValues.map((v) => fetchAllContactsByLeadStatus(v, LEAD_TIME_PROPERTIES))
-  );
+  const results: any[][] = [];
+  for (const v of allStageValues) {
+    results.push(await fetchAllContactsByLeadStatus(v, LEAD_TIME_PROPERTIES));
+    await rateLimitDelay();
+  }
   const contacts = results.flat();
 
   const days: number[] = [];
@@ -561,13 +711,15 @@ async function computeLeadTimeToFirstConversion(): Promise<LeadTimeStats> {
 export async function getLiveAttribution(): Promise<AttributionResponse> {
   const extraProps = [INITIAL_UTM_SOURCE_PROPERTY, HEARD_ABOUT_PROPERTY];
 
-  // Fetch every stage's contacts in parallel, each tagged with a source.
-  const stageResults = await Promise.all(
-    ATTRIBUTION_STAGES.map(async (stage) => {
-      const contacts = await fetchAllContactsByLeadStatus(stage.leadStatusValue, extraProps);
-      return { key: stage.key, contacts: contacts.map(resolveSource) };
-    })
-  );
+  // Fetch every stage's contacts sequentially, not concurrently - firing
+  // all 5 at once was almost certainly the main trigger for HubSpot's
+  // "secondly" rate limit.
+  const stageResults: { key: string; contacts: ReturnType<typeof resolveSource>[] }[] = [];
+  for (const stage of ATTRIBUTION_STAGES) {
+    const contacts = await fetchAllContactsByLeadStatus(stage.leadStatusValue, extraProps);
+    stageResults.push({ key: stage.key, contacts: contacts.map(resolveSource) });
+    await rateLimitDelay();
+  }
 
   const allSources = new Set<string>();
   for (const s of stageResults) for (const c of s.contacts) allSources.add(c.source);

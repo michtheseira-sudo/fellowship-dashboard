@@ -172,6 +172,46 @@ true for that to work correctly:
   `MonthlyYoYChart` component the pipeline stages use, so meetings compare
   to the same period last year the same way the funnel stages do.
 
+## How funnel stage counts are calculated (history-based, not snapshot)
+
+Every stage count in the Funnel tab (goal pacing, funnel drip, and the
+per-stage pipeline charts) is built from one Contact property:
+**`hs_lead_status`**. Early in the live build this was read as a
+snapshot - "who currently has this status right now" - which quietly
+undercounted every stage except the last one, because a contact who
+moved from Accepted → Booked stopped counting as Accepted at all, even
+retroactively. Confirmed weird-looking data in testing traced back to
+exactly this.
+
+It's now built from `hs_lead_status`'s full **property history** instead
+(confirmed safe: this field has been driven by deal-stage automation -
+e.g. Stripe marking a deal "Paid deposit" flips a contact to "Booked
+Fellow" - since well before the current season, so its history is
+trustworthy). The flow, in `lib/providers/hubspot.ts`:
+
+1. `fetchAllContactIdsInSeason(season)` - get every contact who applied
+   this season, no stage filter.
+2. `fetchLeadStatusHistory(ids)` - batch-read (100 at a time) each
+   contact's full history on `hs_lead_status`, sorted oldest-first.
+3. `buildStageCohortDates(season)` - for each funnel stage, find every
+   contact whose history *ever* contains that stage's value, and the
+   timestamp they first hit it. A contact who was Accepted then later
+   Closed Lost still counts toward Accepted - this matches HubSpot's own
+   "has ever been equal to" segment filter, and is the "story" of how
+   someone moved through the funnel rather than where they ended up.
+4. Those per-stage date lists get bucketed into weeks exactly like
+   before, so `computePacing` / `computeFunnelDrip` in
+   `lib/funnelAggregation.ts` didn't need to change at all - they just
+   sum up whatever `StageSeries[].points` they're given.
+
+One consequence worth knowing: conversion rates in the funnel drip
+(Accepted → Booked → Paying → Confirmed) are now genuine cohort-over-
+cohort rates (this stage's ever-reached count ÷ previous stage's
+ever-reached count), not the understated version from before. If a
+future season is added that predates when `hs_lead_status` went live,
+this approach would silently under-count that older season's early
+stages - worth re-checking if that ever comes up.
+
 ## Remaining blockers (carried over from the build brief)
 
 1. **Credentials** — HubSpot private app token or Service Key (Contacts +
@@ -179,33 +219,30 @@ true for that to work correctly:
    lookup — HubSpot doesn't have a separate "meetings" scope; meetings
    access comes via the Contacts scope) and GA4 service account JSON with
    Viewer access. Needed before `USE_MOCK_DATA=false` will work.
-2. **UTM property names** — not yet confirmed with the team. Placeholders
-   are in `config/properties.ts` (`UTM_PROPERTIES`) flagged with `TODO`.
-   The fallback logic (UTM → `heard_about`) is already built — only the
-   exact UTM property names need swapping in.
-3. **Year field** — no dedicated "year" property was confirmed on
+2. **Year field** — no dedicated "year" property was confirmed on
    HubSpot; the app currently derives year from the application/form
    submission date (`config/properties.ts`, `YEAR_SOURCE`). If a clean
    `year` property exists, swap the derivation for a direct property read.
-4. **Deal pipeline ID** — the exact HubSpot pipeline ID containing "Invited
-   to enroll" / "Paid deposit" / "Paid installment" / "Closed won" /
-   "Closed lost" needs confirming before the live deal queries in
-   `lib/providers/hubspot.ts` will resolve correctly.
-5. **Meeting-form association check** — `fetchMeetings()` now calls the
+3. **Meeting-form association check** — `fetchMeetings()` now calls the
    real HubSpot batch associations + Forms API to check which form (if
    any) is attached to each meeting, matching against the four form
    names the team confirmed. Untested against live data — flag it back if
    your portal doesn't expose "form" as a default meeting association
    type (the code comments explain the likely alternative: associating
    via the contact's form submission near the meeting time instead).
-6. **Shopify scope** — which specific Shopify metrics matter beyond GA4
+4. **Shopify scope** — which specific Shopify metrics matter beyond GA4
    (checkout funnel, product/variant views) is still to be confirmed with
    the team; `lib/providers/shopify.ts` covers the most likely candidates.
-7. **Vercel Blob store** — the one setup step that can't be done from
+5. **Vercel Blob store** — the one setup step that can't be done from
    code: create + connect a Blob store in Vercel's dashboard (Storage tab).
    See "Scheduled sync" section above. Without this, live mode fails with
    "No synced data yet" on every page, since the weekly sync has nowhere
    to write its results.
+6. **Season start dates** — `lib/weeks.ts` assumes Summer season starts
+   Jan 15 and Winter starts Jul 15 (a guess, never confirmed with the
+   team). If real application-open dates differ, week-of-season alignment
+   on every chart will be off. Worth confirming if week numbers look
+   wrong even after the history-based funnel fix above.
 
 ## Project structure
 

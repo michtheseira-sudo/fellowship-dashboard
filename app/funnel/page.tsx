@@ -9,7 +9,8 @@ import StageTabs from "@/components/StageTabs";
 import DealsChart from "@/components/DealsChart";
 import MeetingsSection from "@/components/MeetingsChart";
 import DataError from "@/components/DataError";
-import type { FunnelResponse } from "@/lib/types";
+import ApplicationsSummary from "@/components/ApplicationsSummary";
+import type { ApplicationsBreakdown, FunnelResponse } from "@/lib/types";
 
 export default function FunnelPage() {
   const [season, setSeason] = useState<"Summer" | "Winter">("Summer");
@@ -17,6 +18,22 @@ export default function FunnelPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [activeStage, setActiveStage] = useState(0);
+
+  // Applications breakdown is season-agnostic (Summer/Winter/Other all at
+  // once), so it's fetched once, independent of the season toggle above -
+  // it doesn't need to reload when the person switches Summer/Winter.
+  const [applications, setApplications] = useState<ApplicationsBreakdown | null>(null);
+  const [applicationsError, setApplicationsError] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch("/api/applications")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d && d.error) setApplicationsError(d.error);
+        else setApplications(d);
+      })
+      .catch((err) => setApplicationsError(err.message));
+  }, []);
 
   useEffect(() => {
     setLoading(true);
@@ -47,6 +64,13 @@ export default function FunnelPage() {
           Weekly check-ins against quarterly goals, refreshed every Monday morning.
         </p>
       </header>
+
+      {applications && (
+        <section className="mb-8 mt-6">
+          <ApplicationsSummary data={applications} />
+        </section>
+      )}
+      {applicationsError && <DataError message={applicationsError} />}
 
       <FilterBar season={season} onSeasonChange={setSeason} />
 

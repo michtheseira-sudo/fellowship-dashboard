@@ -1,4 +1,17 @@
-export type Season = "Summer" | "Winter" | "Undecided";
+export type Season = "Summer" | "Winter" | "Other";
+
+// Total applications split by season choice, INCLUDING people who haven't
+// decided yet ("Other"). Deliberately separate from per-season goal
+// pacing below - "Other" applicants don't count toward either season's
+// goal until they resolve to Summer or Winter, but they still count as
+// real applications and matter for total-momentum visibility.
+export interface ApplicationsBreakdown {
+  summer: number;
+  winter: number;
+  other: number;
+  asOf: string;
+}
+
 
 export type FunnelStageKey =
   | "lead"

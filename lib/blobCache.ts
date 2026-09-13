@@ -32,6 +32,7 @@ export async function writeCachedJSON(pathname: string, data: unknown): Promise<
 
 export const CACHE_KEYS = {
   funnel: (season: string) => `cache/funnel-${season.toLowerCase()}.json`,
+  applications: "cache/applications.json",
   website: "cache/website.json",
   attribution: "cache/attribution.json",
   syncStatus: "cache/sync-status.json",

@@ -3,6 +3,7 @@ import { dateForWeekOfSeason, currentAndPreviousWeekBounds } from "@/lib/weeks";
 import { toMonthlyPoints } from "@/lib/months";
 import { computePacing, computeFunnelDrip, SEASON_LENGTH_WEEKS } from "@/lib/funnelAggregation";
 import type {
+  ApplicationsBreakdown,
   AttributionResponse,
   DealsBreakdown,
   FunnelResponse,
@@ -79,6 +80,18 @@ function currentWeekCapFor(season: Season, year: number): number | undefined {
     Math.max(1, Math.round((now.getMonth() * 4.3 + now.getDate() / 7) % SEASON_LENGTH_WEEKS) + 3)
   );
   return weekIntoYear;
+}
+
+export function getMockApplications(): ApplicationsBreakdown {
+  // Roughly matches the new_candidate base volumes already used in
+  // getMockFunnel above, plus a smaller "Other" (undecided-season) group.
+  const rand = seededRandom(5151);
+  return {
+    summer: Math.round(85 + rand() * 15),
+    winter: Math.round(70 + rand() * 15),
+    other: Math.round(18 + rand() * 8),
+    asOf: new Date().toISOString(),
+  };
 }
 
 export function getMockFunnel(season: Season): FunnelResponse {
